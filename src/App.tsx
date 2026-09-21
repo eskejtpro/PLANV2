@@ -1,0 +1,1331 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { ModernSidebar } from './components/ModernSidebar';
+import { ModernHeader } from './components/ModernHeader';
+import { WorkoutPlanView } from './components/WorkoutPlanView';
+import { StatsView } from './components/StatsView';
+import { MuscleProgressView } from './components/MuscleProgressView';
+import { BodyWeightView, WeightSubcategoryType } from './components/BodyWeightView';
+import { SettingsView } from './components/SettingsView';
+import { PythonCodeView } from './components/PythonCodeView';
+import { ExerciseManagerView } from './components/ExerciseManagerView';
+import { CycleProtocolView } from './components/CycleProtocolView';
+import { UserProfileView } from './components/UserProfileView';
+import { HoverAnnotationSystem } from './components/HoverAnnotationSystem';
+import { WindowsTitleBar } from './components/WindowsTitleBar';
+import { ExerciseModal } from './components/ExerciseModal';
+import { ExerciseHistoryModal } from './components/ExerciseHistoryModal';
+import { GymData, TrainingWeek, TrainingDay, Exercise, ExerciseHistoryPoint, BodyWeightEntry, CircumferenceEntry, BodyPartMeasurement, AppSettings, LoggedSet, BackupEntry, ProtocolEntry, UserProfile, SyncServerConfig, SyncLogEntry, CatalogExercise } from './types';
+import { initialGymData } from './data/initialData';
+import { DEFAULT_CATALOG_EXERCISES } from './data/defaultCatalogExercises';
+import { PYTHON_SOURCE_CODE, BAT_SCRIPT_CODE, REQUIREMENTS_TXT, INSTALL_BAT_CODE } from './data/pythonSource';
+import { getTodayDateString } from './utils/calculations';
+import { persistence } from './utils/persistence';
+
+const STORAGE_KEY = 'gymtracker_windows_data_v1';
+const BACKUPS_STORAGE_KEY = 'gymtracker_autobackups_v1';
+const normalizeGymData = (raw: GymData): GymData => {
+  const rawSettings = raw.settings || {};
+  const isMigrated = (rawSettings as { _analysisSectionsHiddenDefaultV2?: boolean })._analysisSectionsHiddenDefaultV2 === true;
+  const migratedSettings: AppSettings = {
+    ...initialGymData.settings,
+    ...rawSettings,
+    ...(isMigrated ? {} : {
+      analysisShowWeeklyTonnage: false,
+      analysisShowWeeklyMetrics: false,
+      analysisShowRegularity: false,
+      analysisShowMonthlyComparison: false,
+      analysisShowPeriodComparison: false,
+      _analysisSectionsHiddenDefaultV2: true,
+    } as Partial<AppSettings>),
+  };
+
+  return {
+    ...raw,
+    settings: migratedSettings,
+    circumferences: Array.isArray(raw.circumferences) ? raw.circumferences : [],
+    bodyPartMeasurements: Array.isArray(raw.bodyPartMeasurements)
+      ? raw.bodyPartMeasurements
+      : (initialGymData.bodyPartMeasurements || []),
+    profile: raw.profile || initialGymData.profile,
+    profilesList: Array.isArray(raw.profilesList) && raw.profilesList.length > 0
+      ? raw.profilesList
+      : (initialGymData.profilesList || []),
+    syncConfig: raw.syncConfig || initialGymData.syncConfig,
+    syncLogs: Array.isArray(raw.syncLogs) ? raw.syncLogs : (initialGymData.syncLogs || []),
+    catalogExercises: Array.isArray(raw.catalogExercises) && raw.catalogExercises.length > 0
+      ? raw.catalogExercises
+      : DEFAULT_CATALOG_EXERCISES
+  };
+};
+
+export default function App() {
+  const [data, setData] = useState<GymData>(() => {
+    try {
+      const saved = persistence.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.weeks) return normalizeGymData(parsed);
+      }
+    } catch (e) {
+      if (window.gymDesktop) throw e;
+      console.warn('Could not load from localStorage, using initial data');
+    }
+    return normalizeGymData(initialGymData);
+  });
+
+  const [activeView, setActiveView] = useState<string>(data.settings.startupView || 'plan');
+  const [weightSubcategory, setWeightSubcategory] = useState<WeightSubcategoryType>('all');
+
+  const handleSelectView = (view: string) => {
+    if (view.startsWith('weight:')) {
+      const sub = view.slice(7) as WeightSubcategoryType;
+      setWeightSubcategory(sub);
+      setActiveView('weight');
+    } else if (view === 'weight') {
+      setActiveView('weight');
+    } else {
+      setActiveView(view);
+    }
+  };
+
+  useEffect(() => {
+    if (data.settings.rememberLastView && data.settings.startupView !== activeView) {
+      setData(prev => ({ ...prev, settings: { ...prev.settings, startupView: activeView as AppSettings['startupView'] } }));
+    }
+  }, [activeView, data.settings.rememberLastView, data.settings.startupView]);
+  const [selectedWeekId, setSelectedWeekId] = useState<string>(data.weeks[0]?.id || 'week-1');
+  const [selectedDayId, setSelectedDayId] = useState<string>(data.weeks[0]?.days[0]?.id || 'w1-d1');
+  const [autoSaveStatus, setAutoSaveStatus] = useState<string>('Zapisano w JSON');
+
+  // Modern UI states
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState<boolean>(false);
+
+  // Backups state
+  const [backups, setBackups] = useState<BackupEntry[]>(() => {
+    try {
+      const saved = persistence.getItem(BACKUPS_STORAGE_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch (e) {
+      console.warn('Could not load backups from localStorage');
+    }
+    return [];
+  });
+
+  // Modals state
+  const [isExerciseModalOpen, setIsExerciseModalOpen] = useState(false);
+  const [exerciseToEdit, setExerciseToEdit] = useState<Exercise | null>(null);
+
+  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
+  const [historyExercise, setHistoryExercise] = useState<Exercise | null>(null);
+
+  // Helper function to perform auto-backup
+  const lastBackupStringRef = useRef<string>('');
+  const createAutoBackup = (targetData: GymData, triggerReason: string = 'auto') => {
+    try {
+      const jsonStr = JSON.stringify(targetData);
+      const fingerprint = JSON.stringify({...targetData, settings: {...targetData.settings, lastBackupTime: undefined}});
+      if (triggerReason !== 'manual' && fingerprint === lastBackupStringRef.current) return;
+
+      const now = new Date();
+      const dateTag = now.toISOString().slice(0, 10).replace(/-/g, '');
+      const timeTag = now.toTimeString().slice(0, 8).replace(/:/g, '');
+      const formattedTimestamp = `${now.toLocaleDateString('pl-PL')} ${now.toLocaleTimeString('pl-PL')}`;
+      const fileName = `workout_backup_${dateTag}_${timeTag}.json`;
+      const sizeBytes = new Blob([jsonStr]).size;
+
+      const newBackup: BackupEntry = {
+        id: `backup-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        timestamp: formattedTimestamp,
+        fileName,
+        sizeBytes,
+        weeksCount: targetData.weeks.length,
+        data: JSON.parse(jsonStr)
+      };
+
+      const maxCount = targetData.settings.maxBackupFiles || 15;
+      const updatedBackups = [newBackup, ...backups].slice(0, maxCount);
+      persistence.setItem(BACKUPS_STORAGE_KEY, JSON.stringify(updatedBackups));
+      lastBackupStringRef.current = fingerprint;
+      setBackups(updatedBackups);
+
+      // Update last backup time setting
+      setData((prev) => prev.settings.lastBackupTime === formattedTimestamp ? prev : ({
+        ...prev,
+        settings: {
+          ...prev.settings,
+          lastBackupTime: formattedTimestamp
+        }
+      }));
+    } catch (err) {
+      console.error('Failed to create auto backup', err);
+      throw err;
+    }
+  };
+
+  // Persistence to localStorage & Auto-Backup on Save
+  useEffect(() => {
+    try {
+      persistence.setItem(STORAGE_KEY, JSON.stringify(data));
+      setAutoSaveStatus(data.settings.autoSave === false && window.gymDesktop ? 'Zapis przy zamknięciu' : `Zapisano w JSON (${new Date().toLocaleTimeString()})`);
+
+      // Trigger Auto Backup on Save if enabled
+      if (data.settings.autoBackupEnabled !== false && data.settings.backupOnSave !== false) {
+        createAutoBackup(data, 'save');
+      }
+    } catch (e) {
+      setAutoSaveStatus('Błąd zapisu');
+    }
+  }, [data]);
+
+  // Automatic Backup on App Close (beforeunload)
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (data.settings.autoBackupEnabled !== false && data.settings.backupOnClose !== false) {
+        try {
+          const jsonStr = JSON.stringify(data);
+          const now = new Date();
+          const dateTag = now.toISOString().slice(0, 10).replace(/-/g, '');
+          const timeTag = now.toTimeString().slice(0, 8).replace(/:/g, '');
+          const fileName = `workout_backup_exit_${dateTag}_${timeTag}.json`;
+          const sizeBytes = new Blob([jsonStr]).size;
+
+          const exitBackup: BackupEntry = {
+            id: `backup-exit-${Date.now()}`,
+            timestamp: `${now.toLocaleDateString('pl-PL')} ${now.toLocaleTimeString('pl-PL')} (Zamknięcie)`,
+            fileName,
+            sizeBytes,
+            weeksCount: data.weeks.length,
+            data
+          };
+
+          const existingBackups: BackupEntry[] = JSON.parse(persistence.getItem(BACKUPS_STORAGE_KEY) || '[]');
+          const updated = [exitBackup, ...existingBackups].slice(0, data.settings.maxBackupFiles || 15);
+          persistence.setItem(BACKUPS_STORAGE_KEY, JSON.stringify(updated));
+        } catch (e) {
+          console.error('Error creating exit backup', e);
+        }
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [data]);
+
+  // Backup actions
+  const handleCreateManualBackup = () => {
+    try {
+      createAutoBackup(data, 'manual');
+      alert('Kopia zapasowa została pomyślnie utworzona i zapisana!');
+    } catch { alert('Błąd zapisu kopii zapasowej. Sprawdź dostęp do dysku.'); }
+  };
+
+  const handleRestoreBackup = (backup: BackupEntry) => {
+    if (backup && backup.data && Array.isArray(backup.data.weeks)) {
+      if (window.gymDesktop) window.gymDesktop.validate(JSON.stringify(backup.data));
+      createAutoBackup(data, 'manual');
+      setData(backup.data);
+      if (backup.data.weeks.length > 0) {
+        setSelectedWeekId(backup.data.weeks[0].id);
+        setSelectedDayId(backup.data.weeks[0].days[0]?.id || '');
+      }
+      alert(`Pomyślnie przywrócono dane z kopii z dnia ${backup.timestamp}`);
+    }
+  };
+
+  const handleDownloadBackup = (backup: BackupEntry) => {
+    const jsonStr = JSON.stringify(backup.data, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = backup.fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDeleteBackup = (backupId: string) => {
+    const updated = backups.filter((b) => b.id !== backupId);
+    persistence.setItem(BACKUPS_STORAGE_KEY, JSON.stringify(updated));
+    setBackups(updated);
+  };
+
+  // Ensure selected week/day are valid
+  useEffect(() => {
+    const weekExists = data.weeks.some((w) => w.id === selectedWeekId);
+    if (!weekExists && data.weeks.length > 0) {
+      setSelectedWeekId(data.weeks[0].id);
+      setSelectedDayId(data.weeks[0].days[0]?.id || '');
+    } else {
+      const currentWeek = data.weeks.find((w) => w.id === selectedWeekId);
+      const dayExists = currentWeek?.days.some((d) => d.id === selectedDayId);
+      if (!dayExists && currentWeek?.days && currentWeek.days.length > 0) {
+        setSelectedDayId(currentWeek.days[0].id);
+      }
+    }
+  }, [data.weeks, selectedWeekId, selectedDayId]);
+
+  // Theme toggle
+  const handleToggleTheme = () => {
+    setData((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        theme: prev.settings.theme === 'dark' ? 'light' : 'dark'
+      }
+    }));
+  };
+
+  // Weeks management
+  const handleAddWeek = () => {
+    const newNum = data.weeks.length + 1;
+    const newWeekId = `week-${Date.now()}`;
+    const newWeek: TrainingWeek = {
+      id: newWeekId,
+      number: newNum,
+      name: `Tydzień ${newNum} - Cykl Progresji`,
+      days: [
+        {
+          id: `${newWeekId}-d1`,
+          name: 'Poniedziałek - Push (Klatka / Barki)',
+          completed: false,
+          exercises: []
+        },
+        {
+          id: `${newWeekId}-d2`,
+          name: 'Środa - Pull (Plecy / Biceps)',
+          completed: false,
+          exercises: []
+        },
+        {
+          id: `${newWeekId}-d3`,
+          name: 'Piątek - Legs (Przysiad / Nogi)',
+          completed: false,
+          exercises: []
+        }
+      ]
+    };
+
+    setData((prev) => ({
+      ...prev,
+      weeks: [...prev.weeks, newWeek]
+    }));
+    setSelectedWeekId(newWeekId);
+    setSelectedDayId(`${newWeekId}-d1`);
+  };
+
+  const handleDuplicateWeek = (weekId: string) => {
+    const sourceWeek = data.weeks.find((w) => w.id === weekId);
+    if (!sourceWeek) return;
+
+    const newNum = data.weeks.length + 1;
+    const newWeekId = `week-${Date.now()}`;
+    const duplicatedWeek: TrainingWeek = {
+      id: newWeekId,
+      number: newNum,
+      name: `Tydzień ${newNum} (+2.5kg progres)`,
+      days: sourceWeek.days.map((d, dIdx) => ({
+        id: `${newWeekId}-d${dIdx + 1}`,
+        name: d.name,
+        completed: false,
+        exercises: d.exercises.map((ex) => {
+          const updatedWeight = Math.round((ex.weight + 2.5) * 10) / 10;
+          return {
+            ...ex,
+            id: `ex-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+            weight: updatedWeight,
+            // A duplicated week is a new, uncompleted session. Keep the
+            // exercise history as reference, but never carry completed set
+            // checkmarks into the new session's execution analysis.
+            loggedSets: undefined,
+            history: [...(ex.history || [])]
+          };
+        })
+      }))
+    };
+
+    setData((prev) => ({
+      ...prev,
+      weeks: [...prev.weeks, duplicatedWeek]
+    }));
+    setSelectedWeekId(newWeekId);
+    setSelectedDayId(duplicatedWeek.days[0]?.id || '');
+  };
+
+  const handleDeleteWeek = (weekId: string) => {
+    if (data.weeks.length <= 1) return;
+    if (data.settings.confirmBeforeDelete !== false && !window.confirm('Czy na pewno chcesz usunąć cały tydzień?')) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.filter((w) => w.id !== weekId)
+    }));
+  };
+
+  // Days management
+  const handleAddDay = (weekId: string) => {
+    const week = data.weeks.find((w) => w.id === weekId);
+    if (!week) return;
+    const dayNum = week.days.length + 1;
+    const newDayId = `day-${Date.now()}`;
+    const newDay: TrainingDay = {
+      id: newDayId,
+      name: `Dzień ${dayNum} - Dodatkowy Trening`,
+      completed: false,
+      exercises: []
+    };
+
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) =>
+        w.id === weekId ? { ...w, days: [...w.days, newDay] } : w
+      )
+    }));
+    setSelectedDayId(newDayId);
+  };
+
+  const handleDeleteDay = (weekId: string, dayId: string) => {
+    if (data.settings.confirmBeforeDelete !== false && !window.confirm('Czy na pewno chcesz usunąć dzień?')) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) =>
+        w.id === weekId ? { ...w, days: w.days.filter((d) => d.id !== dayId) } : w
+      )
+    }));
+  };
+
+  const handleToggleDayCompleted = (weekId: string, dayId: string) => {
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            const newCompleted = !d.completed;
+            let updatedExercises = d.exercises;
+            if (newCompleted) {
+              // Never fabricate execution from planned values. History is created
+              // only after the user explicitly saves performance.
+              updatedExercises = d.exercises;
+            }
+            return {
+              ...d,
+              completed: newCompleted,
+              exercises: updatedExercises
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  const handleUpdateDayNotes = (weekId: string, dayId: string, notes: string) => {
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => (d.id === dayId ? { ...d, notes } : d))
+        };
+      })
+    }));
+  };
+
+  // Exercise Performance Save (Sets, Reps, Weight + Logged Sets)
+  const handleSaveExercisePerformance = (
+    weekId: string,
+    dayId: string,
+    exerciseId: string,
+    sets: number,
+    reps: number,
+    weight: number,
+    loggedSets?: LoggedSet[]
+  ) => {
+    const today = getTodayDateString();
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            return {
+              ...d,
+              exercises: d.exercises.map((ex) => {
+                if (ex.id !== exerciseId) return ex;
+                const newPoint: ExerciseHistoryPoint = {
+                  date: today,
+                  weight,
+                  reps,
+                  sets,
+                  rpe: ex.rpe,
+                  loggedSets
+                };
+                return {
+                  ...ex,
+                  sets,
+                  reps,
+                  weight,
+                  loggedSets: loggedSets ?? ex.loggedSets,
+                  history: [...(ex.history || []), newPoint]
+                };
+              })
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  // Exercise Weight Adjustment (+2.5 kg, -2.5 kg, etc.)
+  const handleUpdateExerciseWeight = (
+    weekId: string,
+    dayId: string,
+    exerciseId: string,
+    newWeight: number
+  ) => {
+    const today = getTodayDateString();
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            return {
+              ...d,
+              exercises: d.exercises.map((ex) => {
+                if (ex.id !== exerciseId) return ex;
+                const newPoint: ExerciseHistoryPoint = {
+                  date: today,
+                  weight: newWeight,
+                  reps: ex.reps,
+                  sets: ex.sets,
+                  rpe: ex.rpe
+                };
+                return {
+                  ...ex,
+                  weight: newWeight,
+                  history: [...(ex.history || []), newPoint]
+                };
+              })
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  // Exercise Rename (Quick Inline or Modal)
+  const handleRenameExercise = (
+    weekId: string,
+    dayId: string,
+    exerciseId: string,
+    newName: string
+  ) => {
+    if (!newName.trim()) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            return {
+              ...d,
+              exercises: d.exercises.map((ex) =>
+                ex.id === exerciseId ? { ...ex, name: newName.trim() } : ex
+              )
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  const handleRenameWeek = (weekId: string, newName: string) => {
+    if (!newName.trim()) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => (w.id === weekId ? { ...w, name: newName.trim() } : w))
+    }));
+  };
+
+  const handleRenameDay = (weekId: string, dayId: string, newName: string) => {
+    if (!newName.trim()) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => (d.id === dayId ? { ...d, name: newName.trim() } : d))
+        };
+      })
+    }));
+  };
+
+  // Exercise Add / Edit
+  const handleSaveExercise = (exerciseData: Omit<Exercise, 'id'>, exerciseId?: string) => {
+    const currentWeek = data.weeks.find((w) => exerciseId ? w.days.some(d => d.exercises.some(ex => ex.id === exerciseId)) : w.id === selectedWeekId);
+    const currentDay = currentWeek?.days.find((d) => exerciseId ? d.exercises.some(ex => ex.id === exerciseId) : d.id === selectedDayId);
+    if (!currentWeek || !currentDay) return;
+
+    if (exerciseId) {
+      // Edit existing
+      setData((prev) => ({
+        ...prev,
+        weeks: prev.weeks.map((w) => {
+          if (w.id !== currentWeek.id) return w;
+          return {
+            ...w,
+            days: w.days.map((d) => {
+              if (d.id !== currentDay.id) return d;
+              return {
+                ...d,
+                exercises: d.exercises.map((ex) =>
+                  ex.id === exerciseId ? { ...ex, ...exerciseData, id: exerciseId } : ex
+                )
+              };
+            })
+          };
+        })
+      }));
+    } else {
+      // Add new
+      const newEx: Exercise = {
+        ...exerciseData,
+        id: `ex-${Date.now()}`
+      };
+      setData((prev) => ({
+        ...prev,
+        weeks: prev.weeks.map((w) => {
+          if (w.id !== currentWeek.id) return w;
+          return {
+            ...w,
+            days: w.days.map((d) => {
+              if (d.id !== currentDay.id) return d;
+              return {
+                ...d,
+                exercises: [...d.exercises, newEx]
+              };
+            })
+          };
+        })
+      }));
+    }
+  };
+
+  const handleDeleteExercise = (weekId: string, dayId: string, exerciseId: string) => {
+    if (data.settings.confirmBeforeDelete !== false && !window.confirm('Czy na pewno chcesz usunąć ćwiczenie?')) return;
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            return {
+              ...d,
+              exercises: d.exercises.filter((ex) => ex.id !== exerciseId)
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  const handleUpdateExerciseHistory = (exerciseId: string, newHistory: ExerciseHistoryPoint[]) => {
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => ({
+        ...w,
+        days: w.days.map((d) => ({
+          ...d,
+          exercises: d.exercises.map((ex) => {
+            if (ex.id === exerciseId) {
+              const lastPoint = newHistory[newHistory.length - 1];
+              return {
+                ...ex,
+                history: newHistory,
+                weight: lastPoint ? lastPoint.weight : ex.weight
+              };
+            }
+            return ex;
+          })
+        }))
+      }))
+    }));
+    // Update active modal exercise reference
+    if (historyExercise && historyExercise.id === exerciseId) {
+      setHistoryExercise((prev) => (prev ? { ...prev, history: newHistory } : null));
+    }
+  };
+
+  // Standalone Exercise Catalog Handlers (100% Isolated from Analysis)
+  const catalogExercises = data.catalogExercises || DEFAULT_CATALOG_EXERCISES;
+
+  const handleAddCatalogExercise = (newCatalogEx: Omit<CatalogExercise, 'id'>) => {
+    const item: CatalogExercise = {
+      ...newCatalogEx,
+      id: `cat-custom-${Date.now()}`
+    };
+    setData((prev) => ({
+      ...prev,
+      catalogExercises: [item, ...(prev.catalogExercises || DEFAULT_CATALOG_EXERCISES)]
+    }));
+  };
+
+  const handleEditCatalogExercise = (id: string, updates: Partial<CatalogExercise>) => {
+    setData((prev) => ({
+      ...prev,
+      catalogExercises: (prev.catalogExercises || DEFAULT_CATALOG_EXERCISES).map((ex) =>
+        ex.id === id ? { ...ex, ...updates } : ex
+      )
+    }));
+  };
+
+  const handleDeleteCatalogExercise = (id: string) => {
+    setData((prev) => ({
+      ...prev,
+      catalogExercises: (prev.catalogExercises || DEFAULT_CATALOG_EXERCISES).filter((ex) => ex.id !== id)
+    }));
+  };
+
+  const handleResetCatalogToDefaults = () => {
+    setData((prev) => ({
+      ...prev,
+      catalogExercises: DEFAULT_CATALOG_EXERCISES
+    }));
+  };
+
+  const handleInsertCatalogToPlan = (catalogEx: CatalogExercise, weekId: string, dayId: string, initialWeight: number) => {
+    const newEx: Exercise = {
+      id: `ex-${Date.now()}`,
+      name: catalogEx.name,
+      category: catalogEx.category,
+      sets: catalogEx.defaultSets,
+      reps: catalogEx.defaultReps,
+      weight: initialWeight,
+      rpe: catalogEx.defaultRpe || 8,
+      notes: catalogEx.notes || '',
+      history: []
+    };
+
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => {
+        if (w.id !== weekId) return w;
+        return {
+          ...w,
+          days: w.days.map((d) => {
+            if (d.id !== dayId) return d;
+            return {
+              ...d,
+              exercises: [...d.exercises, newEx]
+            };
+          })
+        };
+      })
+    }));
+  };
+
+  // Body weight entries
+  const handleAddBodyWeight = (entry: Omit<BodyWeightEntry, 'id'>) => {
+    const newEntry: BodyWeightEntry = {
+      ...entry,
+      id: `bw-${Date.now()}`
+    };
+    setData((prev) => ({
+      ...prev,
+      bodyWeights: [...prev.bodyWeights, newEntry]
+    }));
+  };
+
+  const handleDeleteBodyWeight = (id: string) => {
+    setData((prev) => ({
+      ...prev,
+      bodyWeights: prev.bodyWeights.filter((bw) => bw.id !== id)
+    }));
+  };
+
+  const handleAddCircumference = (entry: Omit<CircumferenceEntry, 'id'>) => {
+    const newEntry: CircumferenceEntry = { ...entry, id: `circ-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` };
+    setData((prev) => ({ ...prev, circumferences: [...(prev.circumferences || []), newEntry] }));
+  };
+
+  const handleUpdateCircumference = (entry: CircumferenceEntry) => {
+    setData((prev) => ({ ...prev, circumferences: (prev.circumferences || []).map((item) => item.id === entry.id ? entry : item) }));
+  };
+
+  const handleDeleteCircumference = (id: string) => {
+    setData((prev) => ({ ...prev, circumferences: (prev.circumferences || []).filter((item) => item.id !== id) }));
+  };
+
+  const handleAddBodyMeasurement = (entry: Omit<BodyPartMeasurement, 'id'>) => {
+    const newEntry: BodyPartMeasurement = {
+      ...entry,
+      id: `bpm-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    };
+    setData((prev) => ({
+      ...prev,
+      bodyPartMeasurements: [...(prev.bodyPartMeasurements || []), newEntry]
+    }));
+  };
+
+  const handleDeleteBodyMeasurement = (id: string) => {
+    setData((prev) => ({
+      ...prev,
+      bodyPartMeasurements: (prev.bodyPartMeasurements || []).filter((item) => item.id !== id)
+    }));
+  };
+
+  // Protocol entries (Sterydy, HCG, itp.)
+  const handleAddProtocolEntry = (entry: Omit<ProtocolEntry, 'id'>) => {
+    const newEntry: ProtocolEntry = {
+      ...entry,
+      id: `proto-${Date.now()}`
+    };
+    setData((prev) => ({
+      ...prev,
+      protocolEntries: [...(prev.protocolEntries || []), newEntry]
+    }));
+  };
+
+  const handleDeleteProtocolEntry = (id: string) => {
+    setData((prev) => ({
+      ...prev,
+      protocolEntries: (prev.protocolEntries || []).filter((p) => p.id !== id)
+    }));
+  };
+
+  const handleUpdateWeekStartDate = (weekId: string, startDate: string) => {
+    setData((prev) => ({
+      ...prev,
+      weeks: prev.weeks.map((w) => (w.id === weekId ? { ...w, startDate } : w))
+    }));
+  };
+
+  const handleAddWeekFromGap = (startDate: string, weekNumber: number) => {
+    const newWeek: TrainingWeek = {
+      id: `week-${Date.now()}`,
+      number: weekNumber,
+      name: `Tydzień ${weekNumber} - Plan Treningowy`,
+      startDate,
+      days: [
+        {
+          id: `d-${Date.now()}-1`,
+          name: 'Dzień 1 - Push / Klatka & Barki',
+          completed: false,
+          exercises: []
+        },
+        {
+          id: `d-${Date.now()}-2`,
+          name: 'Dzień 2 - Pull / Plecy & Biceps',
+          completed: false,
+          exercises: []
+        },
+        {
+          id: `d-${Date.now()}-3`,
+          name: 'Dzień 3 - Nogi / Siła & Hipertrofia',
+          completed: false,
+          exercises: []
+        }
+      ]
+    };
+    setData((prev) => ({
+      ...prev,
+      weeks: [...prev.weeks, newWeek].sort((a, b) => a.number - b.number)
+    }));
+  };
+
+  // Settings & JSON
+  const handleUpdateSettings = (newSettings: Partial<AppSettings>) => {
+    setData((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        ...newSettings
+      }
+    }));
+  };
+
+  // User Profile & Android Sync handlers
+  const handleUpdateProfile = (updatedProfile: Partial<UserProfile>) => {
+    setData((prev) => {
+      const currentProfile = prev.profile || initialGymData.profile!;
+      const newProfile: UserProfile = { ...currentProfile, ...updatedProfile };
+      const currentList = prev.profilesList || [currentProfile];
+      const updatedList = currentList.some((p) => p.id === newProfile.id)
+        ? currentList.map((p) => (p.id === newProfile.id ? newProfile : p))
+        : [...currentList, newProfile];
+
+      return {
+        ...prev,
+        profile: newProfile,
+        profilesList: updatedList,
+        settings: {
+          ...prev.settings,
+          athleteName: newProfile.name || prev.settings.athleteName
+        }
+      };
+    });
+  };
+
+  const handleUpdateSyncConfig = (updatedSync: Partial<SyncServerConfig>) => {
+    setData((prev) => ({
+      ...prev,
+      syncConfig: {
+        ...(prev.syncConfig || initialGymData.syncConfig!),
+        ...updatedSync
+      }
+    }));
+  };
+
+  const handleAddSyncLog = (log: SyncLogEntry) => {
+    setData((prev) => ({
+      ...prev,
+      syncLogs: [log, ...(prev.syncLogs || [])].slice(0, 40)
+    }));
+  };
+
+  const handleSwitchProfile = (profileId: string) => {
+    setData((prev) => {
+      const target = (prev.profilesList || []).find((p) => p.id === profileId);
+      if (!target) return prev;
+      return {
+        ...prev,
+        profile: target,
+        settings: {
+          ...prev.settings,
+          athleteName: target.name
+        }
+      };
+    });
+  };
+
+  const handleCreateProfile = (name: string) => {
+    const newId = `prof-${Date.now()}`;
+    const newProf: UserProfile = {
+      id: newId,
+      name,
+      athleteTag: `${name} #${Math.floor(Math.random() * 900 + 100)}`,
+      avatarUrl: '',
+      bio: 'Zawodnik GymTracker Pro.',
+      age: 28,
+      heightCm: 180,
+      experienceLevel: 'sredniozaawansowany',
+      primaryGoal: 'masa',
+      targetWeight: 85,
+      activityLevel: 'aktywny',
+      dailyCalories: 3100,
+      proteinGrams: 180,
+      carbsGrams: 390,
+      fatsGrams: 70
+    };
+
+    setData((prev) => ({
+      ...prev,
+      profile: newProf,
+      profilesList: [...(prev.profilesList || []), newProf],
+      settings: {
+        ...prev.settings,
+        athleteName: newProf.name
+      }
+    }));
+  };
+
+  const handleDeleteProfile = (profileId: string) => {
+    setData((prev) => {
+      const currentList = prev.profilesList || [];
+      if (currentList.length <= 1) return prev;
+      const filtered = currentList.filter((p) => p.id !== profileId);
+      const newActive = filtered[0];
+      return {
+        ...prev,
+        profile: newActive,
+        profilesList: filtered,
+        settings: {
+          ...prev.settings,
+          athleteName: newActive.name
+        }
+      };
+    });
+  };
+
+  const handleExportJson = () => {
+    const jsonStr = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'workout_data.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportJson = (imported: GymData) => {
+    if (window.gymDesktop) window.gymDesktop.validate(JSON.stringify(imported));
+    createAutoBackup(data, 'manual');
+    const normalized = normalizeGymData(imported);
+    setData(normalized);
+    if (normalized.weeks.length > 0) {
+      setSelectedWeekId(normalized.weeks[0].id);
+      setSelectedDayId(normalized.weeks[0].days[0]?.id || '');
+    }
+  };
+
+  const handleResetData = () => {
+    if (window.confirm('Czy na pewno chcesz przywrócić domyślny plan treningowy?')) {
+      setData(initialGymData);
+      setSelectedWeekId(initialGymData.weeks[0].id);
+      setSelectedDayId(initialGymData.weeks[0].days[0].id);
+    }
+  };
+
+  const isDark = data.settings.theme === 'dark';
+  const currentWeek = data.weeks.find((w) => w.id === selectedWeekId) || data.weeks[0];
+  const currentDay = currentWeek?.days.find((d) => d.id === selectedDayId) || currentWeek?.days[0];
+  const uiScale = data.settings.uiScale || 'high';
+
+  // Typography & Windows Layout Classes
+  const fontFamilyClass = data.settings.fontFamilyChoice === 'segoe'
+    ? 'font-windows-segoe'
+    : data.settings.fontFamilyChoice === 'mono'
+    ? 'font-mono-tech'
+    : data.settings.fontFamilyChoice === 'condensed'
+    ? 'font-condensed-pro'
+    : 'font-sans-modern';
+
+  const fontContrastClass = data.settings.fontContrast === 'high_contrast'
+    ? 'high-contrast-text'
+    : data.settings.fontContrast === 'bold_headings'
+    ? 'bold-headings'
+    : '';
+
+  const windowsViewportClass = data.settings.windowsViewportMode === 'fhd_1080p'
+    ? 'windows-frame-fhd'
+    : data.settings.windowsViewportMode === 'laptop_768p'
+    ? 'windows-frame-laptop'
+    : data.settings.windowsViewportMode === 'wqhd_1440p'
+    ? 'windows-frame-wqhd'
+    : data.settings.windowsViewportMode === 'classic_1280x800'
+    ? 'windows-frame-classic'
+    : '';
+
+  const fontSizeScale = data.settings.fontSizeScale || 100;
+
+  return (
+    <div 
+      data-ui-scale={uiScale}
+      className={`min-h-screen ${isDark ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} ${data.settings.reducedMotion ? 'reduce-motion' : ''} ${fontFamilyClass} ${fontContrastClass} ${windowsViewportClass} flex flex-col font-sans antialiased crisp-pixel selection:bg-emerald-500 selection:text-white`}
+      style={{
+        fontSize: fontSizeScale !== 100 ? `${fontSizeScale}%` : undefined
+      }}
+    >
+      {/* Windows Native Titlebar Simulation (if enabled or in desktop mode) */}
+      {data.settings.windowsShowDesktopFrame && (
+        <WindowsTitleBar
+          settings={data.settings}
+          onUpdateSettings={handleUpdateSettings}
+          isDark={isDark}
+        />
+      )}
+
+      <div className="flex-1 flex overflow-hidden">
+        {/* Modern Desktop Sidebar (Left Side) */}
+        <div className="hidden md:flex shrink-0">
+          <ModernSidebar
+            activeView={activeView}
+            weightSubcategory={weightSubcategory}
+            onSelectView={handleSelectView}
+            settings={data.settings}
+            onUpdateSettings={handleUpdateSettings}
+            autoSaveStatus={autoSaveStatus}
+            isCollapsed={isSidebarCollapsed}
+            onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+            weeksCount={data.weeks.length}
+            position="left"
+            profile={data.profile}
+            onUpdateProfile={handleUpdateProfile}
+            syncConfig={data.syncConfig}
+            onUpdateSyncConfig={handleUpdateSyncConfig}
+            currentWeek={currentWeek}
+            selectedDayId={selectedDayId}
+            onSelectDay={setSelectedDayId}
+          />
+        </div>
+
+        {/* Main Workspace Canvas */}
+        <div className="flex-1 flex flex-col h-full overflow-hidden">
+          <ModernHeader
+            activeView={activeView}
+            onSelectView={handleSelectView}
+            settings={data.settings}
+            onUpdateSettings={handleUpdateSettings}
+            autoSaveStatus={autoSaveStatus}
+            onOpenAddExerciseModal={() => {
+              setExerciseToEdit(null);
+              setIsExerciseModalOpen(true);
+            }}
+            onExportJson={handleExportJson}
+            onCreateBackup={handleCreateManualBackup}
+            onToggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            currentWeekName={currentWeek?.name}
+            currentDayName={currentDay?.name}
+          />
+
+        {/* View Switcher Container */}
+        <main className={`flex-1 overflow-hidden flex flex-col ${isDark ? 'bg-slate-950' : 'bg-slate-50'}`}>
+          {activeView === 'plan' && (
+            <WorkoutPlanView
+              weeks={data.weeks}
+              selectedWeekId={selectedWeekId}
+              selectedDayId={selectedDayId}
+              onSelectWeek={setSelectedWeekId}
+              onSelectDay={setSelectedDayId}
+              onAddWeek={handleAddWeek}
+              onDeleteWeek={handleDeleteWeek}
+              onDuplicateWeek={handleDuplicateWeek}
+              onAddDay={handleAddDay}
+              onDeleteDay={handleDeleteDay}
+              onToggleDayCompleted={handleToggleDayCompleted}
+              onUpdateDayNotes={handleUpdateDayNotes}
+              onUpdateExerciseWeight={handleUpdateExerciseWeight}
+              onSaveExercisePerformance={handleSaveExercisePerformance}
+              onRenameExercise={handleRenameExercise}
+              onRenameWeek={handleRenameWeek}
+              onUpdateWeekStartDate={handleUpdateWeekStartDate}
+              onRenameDay={handleRenameDay}
+              onOpenAddExerciseModal={() => {
+                setExerciseToEdit(null);
+                setIsExerciseModalOpen(true);
+              }}
+              onOpenEditExerciseModal={(ex) => {
+                setExerciseToEdit(ex);
+                setIsExerciseModalOpen(true);
+              }}
+              onOpenHistoryModal={(ex) => {
+                setHistoryExercise(ex);
+                setIsHistoryModalOpen(true);
+              }}
+              onDeleteExercise={handleDeleteExercise}
+              unit={data.settings.unit}
+            />
+          )}
+
+          {activeView === 'stats' && (
+            <StatsView
+              weeks={data.weeks}
+              bodyWeights={data.bodyWeights || []}
+              unit={data.settings.unit}
+              analysisOnlyCompleted={data.settings.analysisOnlyCompleted !== false}
+              analysisHideEmptyGroups={data.settings.analysisHideEmptyGroups !== false}
+              analysisIncludePartialHistory={data.settings.analysisIncludePartialHistory === true}
+              analysisStartWeek={data.settings.analysisStartWeek || 1}
+              analysisEndWeek={data.settings.analysisEndWeek || 999}
+              analysisDefaultMetric={data.settings.analysisDefaultMetric || 'progressPct'}
+              analysisShowDataQualityWarnings={data.settings.analysisShowDataQualityWarnings !== false}
+              analysisRequireHistoryForCompleted={data.settings.analysisRequireHistoryForCompleted !== false} analysisWarnVolumeJumpPct={data.settings.analysisWarnVolumeJumpPct || 30}
+              analysisMinExecutedSets={data.settings.analysisMinExecutedSets || 1}
+              analysisWarnMissingHistory={data.settings.analysisWarnMissingHistory !== false}
+              analysisShowExecutionSummary={data.settings.analysisShowExecutionSummary !== false}
+              analysisShowWeekComparison={data.settings.analysisShowWeekComparison !== false}
+              analysisShowWeeklyTonnage={data.settings.analysisShowWeeklyTonnage === true}
+              analysisShowWeeklyMetrics={data.settings.analysisShowWeeklyMetrics === true}
+              analysisShowExecutedDays={data.settings.analysisShowExecutedDays !== false}
+              analysisShowExecutedExercises={data.settings.analysisShowExecutedExercises !== false}
+              analysisShowExecutedSets={data.settings.analysisShowExecutedSets !== false}
+              analysisShowExecutedReps={data.settings.analysisShowExecutedReps !== false}
+              analysisShowVolumeDelta={data.settings.analysisShowVolumeDelta !== false}
+              analysisShowDataConfidence={data.settings.analysisShowDataConfidence !== false}
+              analysisShowBestE1RM={data.settings.analysisShowBestE1RM !== false}
+              analysisShowLatestResult={data.settings.analysisShowLatestResult !== false}
+              analysisShowTrendLine={data.settings.analysisShowTrendLine !== false}
+              analysisShowPRMarkers={data.settings.analysisShowPRMarkers !== false}
+              analysisPRMetric={data.settings.analysisPRMetric || 'e1RM'}
+              analysisStagnationWindow={data.settings.analysisStagnationWindow || 4}
+              analysisStagnationMinSessions={data.settings.analysisStagnationMinSessions || 3}
+              analysisShowRegularity={data.settings.analysisShowRegularity === true}
+              analysisRegularityTargetPct={data.settings.analysisRegularityTargetPct || 80}
+              analysisShowMonthlyComparison={data.settings.analysisShowMonthlyComparison === true}
+              analysisMonthlyMetric={data.settings.analysisMonthlyMetric || 'volume'}
+              analysisShowPeriodComparison={data.settings.analysisShowPeriodComparison === true}
+              analysisPeriodComparisonMetric={data.settings.analysisPeriodComparisonMetric || 'volume'}
+              analysisShowRollingVolume={data.settings.analysisShowRollingVolume === true}
+              analysisReportLayout={data.settings.analysisReportLayout || 'bento_left'}
+              analysisShowLayoutSwitcher={data.settings.analysisShowLayoutSwitcher === true}
+              analysisShowAiAgent={data.settings.analysisShowAiAgent !== false}
+              aiAgentMode={data.settings.aiAgentMode || 'heuristic_local'}
+              aiAgentServerUrl={data.settings.aiAgentServerUrl || ''}
+              aiAgentApiKey={data.settings.aiAgentApiKey || ''}
+              aiAgentPersona={data.settings.aiAgentPersona || 'balanced'}
+              aiAgentFocus={data.settings.aiAgentFocus || 'all_muscles'}
+              aiAgentResponseLength={data.settings.aiAgentResponseLength || 'concise'}
+            />
+          )}
+
+          {activeView === 'muscle' && (
+              <MuscleProgressView weeks={data.weeks} unit={data.settings.unit} analysisOnlyCompleted={data.settings.analysisOnlyCompleted !== false} analysisHideEmptyGroups={data.settings.analysisHideEmptyGroups !== false} analysisIncludePartialHistory={data.settings.analysisIncludePartialHistory === true} analysisStartWeek={data.settings.analysisStartWeek || 1} analysisEndWeek={data.settings.analysisEndWeek || 999} analysisDefaultMetric={data.settings.analysisDefaultMetric || 'progressPct'} analysisShowDataQualityWarnings={data.settings.analysisShowDataQualityWarnings !== false} analysisRequireHistoryForCompleted={data.settings.analysisRequireHistoryForCompleted !== false} analysisMinExecutedSets={data.settings.analysisMinExecutedSets || 1} analysisWarnMissingHistory={data.settings.analysisWarnMissingHistory !== false} analysisShowExecutionSummary={data.settings.analysisShowExecutionSummary !== false} analysisShowMuscleFrequency={data.settings.analysisShowMuscleFrequency !== false} />
+          )}
+
+          {(activeView === 'weight' || activeView.startsWith('weight:')) && (
+            <BodyWeightView
+              bodyWeights={data.bodyWeights || []}
+              onAddBodyWeight={handleAddBodyWeight}
+              onDeleteBodyWeight={handleDeleteBodyWeight}
+              circumferences={data.circumferences || []}
+              bodyPartMeasurements={data.bodyPartMeasurements || []}
+              onAddBodyMeasurement={handleAddBodyMeasurement}
+              onDeleteBodyMeasurement={handleDeleteBodyMeasurement}
+              weeks={data.weeks}
+              onAddCircumference={handleAddCircumference}
+              onUpdateCircumference={handleUpdateCircumference}
+              onDeleteCircumference={handleDeleteCircumference}
+              unit={data.settings.unit}
+              activeSubcategory={weightSubcategory}
+              onSelectSubcategory={setWeightSubcategory}
+            />
+          )}
+
+          {activeView === 'cycles' && (
+            <CycleProtocolView
+              protocolEntries={data.protocolEntries || []}
+              weeks={data.weeks}
+              settings={data.settings}
+              bodyWeights={data.bodyWeights || []}
+              bodyPartMeasurements={data.bodyPartMeasurements || []}
+              onAddProtocolEntry={handleAddProtocolEntry}
+              onDeleteProtocolEntry={handleDeleteProtocolEntry}
+              onUpdateWeekStartDate={handleUpdateWeekStartDate}
+              onAddWeekFromGap={handleAddWeekFromGap}
+            />
+          )}
+
+          {activeView === 'exercises' && (
+            <ExerciseManagerView
+              catalogExercises={catalogExercises}
+              weeks={data.weeks}
+              onAddCatalogExercise={handleAddCatalogExercise}
+              onEditCatalogExercise={handleEditCatalogExercise}
+              onDeleteCatalogExercise={handleDeleteCatalogExercise}
+              onResetCatalogToDefaults={handleResetCatalogToDefaults}
+              onInsertToPlan={handleInsertCatalogToPlan}
+              unit={data.settings.unit}
+            />
+          )}
+
+          {activeView === 'profile' && (
+            <UserProfileView
+              data={data}
+              onUpdateProfile={handleUpdateProfile}
+              onUpdateSyncConfig={handleUpdateSyncConfig}
+              onAddSyncLog={handleAddSyncLog}
+              onSwitchProfile={handleSwitchProfile}
+              onCreateProfile={handleCreateProfile}
+              onDeleteProfile={handleDeleteProfile}
+              unit={data.settings.unit}
+            />
+          )}
+
+          {activeView === 'settings' && (
+            <SettingsView
+              data={data}
+              onUpdateSettings={handleUpdateSettings}
+              onExportJson={handleExportJson}
+              onImportJson={handleImportJson}
+              onResetData={handleResetData}
+              backups={backups}
+              onCreateBackup={handleCreateManualBackup}
+              onRestoreBackup={handleRestoreBackup}
+              onDownloadBackup={handleDownloadBackup}
+              onDeleteBackup={handleDeleteBackup}
+              onUpdateSyncConfig={handleUpdateSyncConfig}
+              onNavigateToProfile={() => setActiveView('profile')}
+            />
+          )}
+
+          {activeView === 'python' && (
+            <PythonCodeView
+              pythonCode={PYTHON_SOURCE_CODE}
+              batchScript={BAT_SCRIPT_CODE}
+              requirementsTxt={REQUIREMENTS_TXT}
+              installScript={INSTALL_BAT_CODE}
+            />
+          )}
+        </main>
+        </div>
+      </div>
+
+      {/* Mobile Drawer Navigation (Left Side) */}
+      {isMobileMenuOpen && (
+        <div className="fixed inset-0 z-50 flex justify-start md:hidden animate-fadeIn">
+          <div 
+            className="fixed inset-0 bg-black/70 backdrop-blur-xs"
+            onClick={() => setIsMobileMenuOpen(false)}
+          />
+          <div className="relative z-10 w-72 h-full shadow-2xl">
+            <ModernSidebar
+              activeView={activeView}
+              weightSubcategory={weightSubcategory}
+              onSelectView={(v) => {
+                handleSelectView(v);
+                setIsMobileMenuOpen(false);
+              }}
+              settings={data.settings}
+              onUpdateSettings={handleUpdateSettings}
+              autoSaveStatus={autoSaveStatus}
+              isCollapsed={false}
+              onToggleCollapse={() => setIsMobileMenuOpen(false)}
+              weeksCount={data.weeks.length}
+              position="left"
+              profile={data.profile}
+              onUpdateProfile={handleUpdateProfile}
+              syncConfig={data.syncConfig}
+              onUpdateSyncConfig={handleUpdateSyncConfig}
+              currentWeek={currentWeek}
+              selectedDayId={selectedDayId}
+              onSelectDay={setSelectedDayId}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Modals */}
+      <ExerciseModal
+        isOpen={isExerciseModalOpen}
+        onClose={() => setIsExerciseModalOpen(false)}
+        onSave={handleSaveExercise}
+        exerciseToEdit={exerciseToEdit}
+        unit={data.settings.unit}
+      />
+
+      <ExerciseHistoryModal
+        isOpen={isHistoryModalOpen}
+        onClose={() => setIsHistoryModalOpen(false)}
+        exercise={historyExercise}
+        onUpdateHistory={handleUpdateExerciseHistory}
+        unit={data.settings.unit}
+      />
+
+      {/* Global Interactive Hover Annotation System */}
+      <HoverAnnotationSystem
+        enabled={data.settings.showHoverAnnotations !== false}
+        onOpenSettings={() => setActiveView('settings')}
+        isDark={isDark}
+      />
+    </div>
+  );
+}
